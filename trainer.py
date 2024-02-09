@@ -1,3 +1,5 @@
+import sys
+import os
 import lightning.pytorch as pl
 from model import FairseqWrapper, DiscreteEncoder
 from dataset import SpeechTextDataset, get_dataloader
@@ -5,48 +7,79 @@ import torch
 from torch.utils.data.distributed import DistributedSampler
 from lightning.pytorch.accelerators import find_usable_cuda_devices
 import torch.nn as nn
-import os
 import argparse  
 import yaml
 import munch
 from lightning.pytorch.plugins.environments import SLURMEnvironment
 import signal
+from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch import loggers as pl_loggers
+from scheduler import get_cosine_schedule_with_warmup
+from lightning.pytorch.callbacks import LearningRateMonitor
+import glob
+from utils import extract_number, replace_values 
+import json
 
-
-class Distillation(pl.LightningModule): 
-    def __init__(self, args, conf): 
+class DistillDataModule(pl.LightningDataModule):
+    def __init__(self, args, conf):
         super().__init__()
+        self.prepare_data_per_node = True
         self.args = args
         self.conf = conf
-        self.ssl_model = FairseqWrapper(self.conf.data.checkpoint, freeze=self.conf.model.freeze)
-        self.reverse_model = DiscreteEncoder(vocab_file=self.conf.data.vocab_file)
-        self.layer_weight_params = nn.Parameter(torch.zeros([1, conf.model.n_layers], dtype=torch.float32))
-        self.softmax = nn.Softmax(dim=1)
-        if conf.model.const_layer_weights:
-            self.layer_weight_params.requires_grad = False
 
-    def configure_optimizers(self): 
-        optimizer_class = getattr(torch.optim, self.conf.optimizer.name)
-        return optimizer_class(self.parameters(), lr=self.conf.optimizer.lr) 
-    
-    #def test_dataloader(self):
-    #    pass 
-
-    def prepare_data(self): 
-        self.train_set = SpeechTextDataset(self.args.train_id_file, self.args.data_dir, self.args.textgrid_dir, vocab_file=self.conf.data.vocab_file)  
-        self.val_set = SpeechTextDataset(self.args.valid_id_file, self.args.data_dir, self.args.textgrid_dir, vocab_file=self.conf.data.vocab_file) 
+    def setup(self, stage: str):
+        if stage == "fit":
+            self.train_set = SpeechTextDataset(self.args.train_id_file, self.args.data_dir, self.args.textgrid_dir, vocab_file=self.conf.data.vocab_file)  
+            self.val_set = SpeechTextDataset(self.args.valid_id_file, self.args.data_dir, self.args.textgrid_dir, vocab_file=self.conf.data.vocab_file)
         return
 
     def train_dataloader(self):
-        sampler = DistributedSampler(self.train_set, shuffle=True, num_replicas=self.args.n_devices)
-        train_loader = get_dataloader(self.train_set, batch_size=self.conf.training.batch_size // self.args.n_devices, sampler=sampler)
+        #sampler = DistributedSampler(self.train_set, shuffle=True, num_replicas=self.args.n_devices)
+        #train_loader = get_dataloader(self.train_set, batch_size=self.conf.training.batch_size // self.args.n_devices, sampler=sampler)
+        train_loader = get_dataloader(self.train_set, batch_size=self.conf.training.batch_size // self.args.n_devices, shuffle=True)
         return train_loader
 
     def val_dataloader(self):
         val_loader = get_dataloader(self.val_set, batch_size=self.conf.training.batch_size, shuffle=False)
         return val_loader
 
-    def forward(self, batch):
+class Distillation(pl.LightningModule): 
+    def __init__(self, args, conf): 
+        super().__init__()
+        self.args = args
+        self.conf = conf
+        self.ssl_model = FairseqWrapper(self.conf.model.checkpoint, freeze=self.conf.model.freeze)
+        self.reverse_model = DiscreteEncoder(vocab_file=self.conf.data.vocab_file, re_init=self.conf.model.re_init)
+        self.layer_weight_params = nn.Parameter(torch.zeros([1, conf.model.n_layers], dtype=torch.float32))
+        self.softmax = nn.Softmax(dim=1)
+        if self.conf.optimizer.loss_function == "mse":
+            self.loss_fn = torch.nn.MSELoss(reduction="none")
+        elif self.conf.optimizer.loss_function == "L1":
+            self.loss_fn = torch.nn.L1Loss(reduction="none") 
+        elif self.conf.optimizer.loss_function == "smoothL1":
+            self.loss_fn = torch.nn.SmoothL1Loss(reduction="none", beta=self.conf.training.beta) 
+        else:
+            raise NotImplementedError(f"{self.conf.optimizer.loss_function} not implemented.")
+        if conf.model.const_layer_weights:
+            self.layer_weight_params.requires_grad = False
+
+    def configure_optimizers(self): 
+        optimizer_class = getattr(torch.optim, self.conf.optimizer.name)
+        opt = optimizer_class(self.parameters(), lr=self.conf.optimizer.lr)
+        scheduler = get_cosine_schedule_with_warmup(opt, num_warmup_steps=self.conf.training.num_warmup_steps, num_training_steps=self.conf.training.max_steps)
+        lr_scheduler_config = {
+            "optimizer": opt,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            }
+        }
+        return lr_scheduler_config
+    
+    def forward(self, batch, return_feature=False):
+        if self._trainer is not None:
+            lr = self.trainer.lr_scheduler_configs[0].scheduler.get_last_lr()[0]
         ids, wavs, wav_len, text_inputs = batch
         ssl_feats = self.ssl_model(wavs, wav_len)
         feat_dim = ssl_feats.shape[-1]
@@ -59,19 +92,25 @@ class Distillation(pl.LightningModule):
         reversed_feats = torch.flip(ssl_feats, dims=[1])
         layer_weights = self.softmax(self.layer_weight_params)
         layer_weights = layer_weights.reshape(1, self.layer_weight_params.shape[1], 1, 1)
-        loss = (layer_weights * ((distilled_feats - reversed_feats) ** 2)).sum(dim=1)
+        loss = (layer_weights * self.loss_fn(distilled_feats, reversed_feats)).sum(dim=1)
+        #loss = (layer_weights * ((distilled_feats - reversed_feats) ** 2)).sum(dim=1)
         loss_mask = text_inputs["attention_mask"].unsqueeze(dim=2)
         loss_mask = loss_mask[:, :length, :]
-        loss = torch.sum(loss * loss_mask) / torch.sum(loss_mask) / feat_dim 
-        return loss
+        loss = torch.sum(loss * loss_mask) / torch.sum(loss_mask) / feat_dim
+
+        if not return_feature:
+            return loss, lr
+        else:
+            return loss, ssl_feats, distilled_feats
     
     def training_step(self, batch, batch_idx): 
-        loss = self.forward(batch)
+        loss, lr = self.forward(batch)
         self.log("mse_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log("lr", lr, on_step=True, on_epoch=True, logger=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx): 
-        loss = self.forward(batch)
+        loss, _ = self.forward(batch)
         self.log("val_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         return loss
     
@@ -94,16 +133,49 @@ def main():
     parser.add_argument('--valid_id_file', help='Path to validation dataset ids for LJSpeech', default="/share/data/speech/jjery2243542/data/LJSpeech/valid.txt")
     parser.add_argument('--save_path', help='Path to save checkpoints', default="/home-nfs/jjery2243542/reverse_feature_distillation/checkpoints")
     parser.add_argument('--n_devices', help='number of gpus', default=1, type=int)
+    parser.add_argument('--every_n_steps', help='every n steps, do validation and checkpointing', default=5000, type=int)
+    parser.add_argument('--override', help='override the hyperparameters in conf', default=None, type=str)
 
     args = parser.parse_args()
 
     with open(args.conf) as f:
         conf = yaml.safe_load(f)
+
+    if args.override is not None:
+        overrides = eval(args.override)
+        replace_values(conf, overrides)
     conf = munch.munchify(conf)
 
     distillation = Distillation(args, conf)
-    trainer = pl.Trainer(default_root_dir=args.save_path, max_epochs=conf.training.epochs, strategy='ddp_find_unused_parameters_true', plugins=[SLURMEnvironment(requeue_signal=signal.SIGHUP)])
-    trainer.fit(distillation)
+    conf_path = args.conf.split("/")[-1].replace(".yaml", "")
+    ckpt_dir = os.path.join(args.save_path, conf_path)
+    ckpts = sorted(glob.glob(f"{ckpt_dir}/*.ckpt"), key=extract_number)
+    ckpt_path = None if len(ckpts) == 0 else ckpts[-1]
+    if ckpt_path is not None:
+        print(f"loading from {ckpt_path}")
+
+    # save conf to ckpt_dir
+    conf_dict = conf.toDict()
+    with open(os.path.join(ckpt_dir, "conf.yaml"), "w") as f:
+        yaml.dump(conf_dict, f)
+
+    checkpoint_callback = ModelCheckpoint(
+        save_top_k=5,
+        monitor="step",
+        mode="max",
+        every_n_train_steps=args.every_n_steps, 
+        dirpath=ckpt_dir,
+        filename="model-{step:07d}",
+    )
+
+    tb_logger = pl_loggers.TensorBoardLogger(save_dir=f"{ckpt_dir}/logs/")
+    lr_monitor = LearningRateMonitor(logging_interval='step')
+    
+    #trainer = pl.Trainer(accelerator="cuda", devices=args.n_devices, max_steps=conf.training.max_steps, plugins=[SLURMEnvironment(requeue_signal=signal.SIGHUP)], callbacks=[checkpoint_callback, lr_monitor], val_check_interval=args.every_n_steps, check_val_every_n_epoch=None, logger=tb_logger, use_distributed_sampler=True, strategy='ddp_find_unused_parameters_true', gradient_clip_val=conf.training.clip)
+    trainer = pl.Trainer(accelerator="cuda", devices=args.n_devices, max_steps=conf.training.max_steps, callbacks=[checkpoint_callback, lr_monitor], val_check_interval=args.every_n_steps, check_val_every_n_epoch=None, logger=tb_logger, use_distributed_sampler=True, strategy='ddp_find_unused_parameters_true', gradient_clip_val=conf.training.clip)
+    data = DistillDataModule(args, conf)
+    
+    trainer.fit(distillation, data, ckpt_path=ckpt_path)
 
 if __name__ == "__main__":
     main()

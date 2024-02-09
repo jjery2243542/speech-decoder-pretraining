@@ -61,7 +61,7 @@ class SpeechTextDataset(Dataset):
             wav = torchaudio.functional.resample(wav, sr, self.default_sr)
         dup_phns, phns, durations = self.phn_list[index]
         dup_phn_strings = " ".join(dup_phns)
-        return id, wav, dup_phn_strings
+        return id, wav, dup_phn_strings, phns, durations
 
 class Collator:
     def __init__(self, tokenizer):
@@ -76,8 +76,12 @@ class Collator:
         return ids, wavs, wav_len, ret #ret["input_ids"], ret["attention_mask"]
 
 
-def get_dataloader(dataset, batch_size, shuffle, drop_last=True):
+def get_dataloader(dataset, batch_size, shuffle=True, sampler=None, drop_last=True):
     collator = Collator(dataset.tokenizer)
-    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, 
-            num_workers=os.cpu_count(), collate_fn=collator.collate_fn, drop_last=drop_last)
+    if sampler is None:
+        data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, 
+                num_workers=0, collate_fn=collator.collate_fn, drop_last=drop_last)
+    else:
+        data_loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, 
+                num_workers=0, collate_fn=collator.collate_fn, drop_last=drop_last)
     return data_loader
