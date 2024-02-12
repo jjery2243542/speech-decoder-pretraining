@@ -7,20 +7,21 @@ import torch
 from torch.utils.data.distributed import DistributedSampler
 from lightning.pytorch.accelerators import find_usable_cuda_devices
 import torch.nn as nn
-import argparse  
+import argparse 
+import wandb
 import yaml
 import munch
 from lightning.pytorch.plugins.environments import SLURMEnvironment
 import signal
 from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch import loggers as pl_loggers
+from lightning.pytorch.loggers import WandbLogger
 from scheduler import get_cosine_schedule_with_warmup
 from lightning.pytorch.callbacks import LearningRateMonitor
 import glob
 from utils import extract_number, replace_values 
 import json
 
-class DistillDataModule(pl.LightningDataModule):
+class SpeechTextDataModule(pl.LightningDataModule):
     def __init__(self, args, conf):
         super().__init__()
         self.prepare_data_per_node = True
@@ -48,16 +49,21 @@ class Distillation(pl.LightningModule):
         super().__init__()
         self.args = args
         self.conf = conf
+        conf_dict = self.conf.toDict()
+        self.save_hyperparameters(conf_dict)
+
         self.ssl_model = FairseqWrapper(self.conf.model.checkpoint, freeze=self.conf.model.freeze)
         self.reverse_model = DiscreteEncoder(vocab_file=self.conf.data.vocab_file, re_init=self.conf.model.re_init)
         self.layer_weight_params = nn.Parameter(torch.zeros([1, conf.model.n_layers], dtype=torch.float32))
         self.softmax = nn.Softmax(dim=1)
-        if self.conf.optimizer.loss_function == "mse":
+        self.linears = nn.ModuleList([nn.Linear(self.conf.model.student_feature_dim, self.conf.model.teacher_feature_dim) for _ in range(self.conf.model.n_layers)])
+
+        if self.conf.optimizer.loss_function == "MSE":
             self.loss_fn = torch.nn.MSELoss(reduction="none")
         elif self.conf.optimizer.loss_function == "L1":
             self.loss_fn = torch.nn.L1Loss(reduction="none") 
-        elif self.conf.optimizer.loss_function == "smoothL1":
-            self.loss_fn = torch.nn.SmoothL1Loss(reduction="none", beta=self.conf.training.beta) 
+        elif self.conf.optimizer.loss_function == "SmoothL1":
+            self.loss_fn = torch.nn.SmoothL1Loss(reduction="none", beta=self.conf.optimizer.beta) 
         else:
             raise NotImplementedError(f"{self.conf.optimizer.loss_function} not implemented.")
         if conf.model.const_layer_weights:
@@ -88,11 +94,18 @@ class Distillation(pl.LightningModule):
 
         length = min(ssl_feats.shape[2], distilled_feats.shape[2])
         ssl_feats = ssl_feats[:, :, :length]
-        distilled_feats = distilled_feats[:, :, :length]
         reversed_feats = torch.flip(ssl_feats, dims=[1])
+        distilled_feats = distilled_feats[:, :, :length]
+
+        transformed_feats = []
+        for l in range(self.conf.model.n_layers):
+            feats = self.linears[l](distilled_feats[:, l])
+            transformed_feats.append(feats)
+        transformed_feats = torch.stack(transformed_feats, dim=1)
+
         layer_weights = self.softmax(self.layer_weight_params)
         layer_weights = layer_weights.reshape(1, self.layer_weight_params.shape[1], 1, 1)
-        loss = (layer_weights * self.loss_fn(distilled_feats, reversed_feats)).sum(dim=1)
+        loss = (layer_weights * self.loss_fn(transformed_feats, reversed_feats)).sum(dim=1)
         #loss = (layer_weights * ((distilled_feats - reversed_feats) ** 2)).sum(dim=1)
         loss_mask = text_inputs["attention_mask"].unsqueeze(dim=2)
         loss_mask = loss_mask[:, :length, :]
@@ -105,13 +118,13 @@ class Distillation(pl.LightningModule):
     
     def training_step(self, batch, batch_idx): 
         loss, lr = self.forward(batch)
-        self.log("mse_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        self.log("lr", lr, on_step=True, on_epoch=True, logger=True, sync_dist=True)
+        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log("train/lr", lr, on_step=True, on_epoch=True, logger=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx): 
         loss, _ = self.forward(batch)
-        self.log("val_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log("validation/loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         return loss
     
     #def validation_epoch_end(self, outputs): 
@@ -156,6 +169,9 @@ def main():
 
     # save conf to ckpt_dir
     conf_dict = conf.toDict()
+    if not os.path.exists(ckpt_dir):
+        os.makedirs(ckpt_dir)
+
     with open(os.path.join(ckpt_dir, "conf.yaml"), "w") as f:
         yaml.dump(conf_dict, f)
 
@@ -168,14 +184,21 @@ def main():
         filename="model-{step:07d}",
     )
 
-    tb_logger = pl_loggers.TensorBoardLogger(save_dir=f"{ckpt_dir}/logs/")
+    #tb_logger = pl_loggers.TensorBoardLogger(save_dir=f"{ckpt_dir}/logs/")
+    wandb.login()
+    wandb_logger = WandbLogger(project="distillation", name=ckpt_dir)
+    wandb_logger.watch(distillation, log_freq=args.every_n_steps, log_graph=False)
+
     lr_monitor = LearningRateMonitor(logging_interval='step')
     
     #trainer = pl.Trainer(accelerator="cuda", devices=args.n_devices, max_steps=conf.training.max_steps, plugins=[SLURMEnvironment(requeue_signal=signal.SIGHUP)], callbacks=[checkpoint_callback, lr_monitor], val_check_interval=args.every_n_steps, check_val_every_n_epoch=None, logger=tb_logger, use_distributed_sampler=True, strategy='ddp_find_unused_parameters_true', gradient_clip_val=conf.training.clip)
-    trainer = pl.Trainer(accelerator="cuda", devices=args.n_devices, max_steps=conf.training.max_steps, callbacks=[checkpoint_callback, lr_monitor], val_check_interval=args.every_n_steps, check_val_every_n_epoch=None, logger=tb_logger, use_distributed_sampler=True, strategy='ddp_find_unused_parameters_true', gradient_clip_val=conf.training.clip)
-    data = DistillDataModule(args, conf)
-    
-    trainer.fit(distillation, data, ckpt_path=ckpt_path)
+    trainer = pl.Trainer(accelerator="cuda", devices=args.n_devices, max_steps=conf.training.max_steps, callbacks=[checkpoint_callback, lr_monitor], val_check_interval=args.every_n_steps, check_val_every_n_epoch=None, logger=wandb_logger, use_distributed_sampler=True, strategy='ddp_find_unused_parameters_true', gradient_clip_val=conf.training.clip)
+    data = SpeechTextDataModule(args, conf)
+    try:
+        trainer.fit(distillation, data, ckpt_path=ckpt_path)
+    except KeyboardInterrupt:
+        sys.exit()
+
 
 if __name__ == "__main__":
     main()
