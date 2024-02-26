@@ -146,8 +146,7 @@ class Collator:
         if self.mel_collator == "sb":
             mels = [wav2mel_sb(wav) for wav in wavs]
         elif self.mel_collator == "bigvgan":
-            print(wavs[0].shape)
-            mels = [self.bigvgan_mel.wav2mel(wav) for wav in wavs]
+            mels = [self.bigvgan_mel.wav2mel(wav.unsqueeze(0)) for wav in wavs]
 
         mels, mel_len = sb.utils.data_utils.batch_pad_right(mels)
         ret = self.tokenizer(phn_strings, return_tensors="pt", padding=True, add_special_tokens=False)
