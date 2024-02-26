@@ -1,4 +1,7 @@
+import sys
+sys.path.append("/home-nfs/jjery2243542/BigVGAN")
 from torch.utils.data import Dataset, DataLoader
+import lightning.pytorch as pl
 import torchaudio
 import textgrid
 import math
@@ -7,6 +10,41 @@ import glob
 import os
 from transformers import BertConfig, BertModel, BertTokenizer
 import speechbrain as sb
+from speechbrain.lobes.models.FastSpeech2 import mel_spectogram
+import json 
+from meldataset import mel_spectrogram, MAX_WAV_VALUE
+from env import AttrDict
+
+def wav2mel_sb(signal):
+    spectrogram, _ = mel_spectogram(
+        audio=signal.squeeze(),
+        sample_rate=16000,
+        hop_length=256,
+        win_length=1024,
+        n_mels=80,
+        n_fft=1024,
+        f_min=0.0,
+        f_max=8000.0,
+        power=1,
+        normalized=False,
+        min_max_energy_norm=True,
+        norm="slaney",
+        mel_scale="slaney",
+        compression=True
+    )
+    return spectrogram.T
+
+class BigVGANMel:
+    def __init__(self, checkpoint_file="/share/data/speech/jjery2243542/checkpoints/BigVGAN_checkpoints/bigvgan_22khz_80band/g_05000000.zip"):
+        config_file = os.path.join(os.path.split(checkpoint_file)[0], 'config.json')
+        with open(config_file) as f:
+            data = f.read()
+
+        json_config = json.loads(data)
+        self.h = AttrDict(json_config)
+
+    def wav2mel(self, signal):
+        return mel_spectrogram(signal, self.h.n_fft, self.h.num_mels, self.h.sampling_rate, self.h.hop_size, self.h.win_size, self.h.fmin, self.h.fmax).transpose(1, 2)
 
 def remove_digit_part(input_string):
     # Use regular expression to remove digits
@@ -26,6 +64,29 @@ def tg2phn(tg, frame_time=0.02):
         phns.append(phn)
         durations.append(end - start)
     return dup_phns, phns, durations   
+
+class SpeechTextDataModule(pl.LightningDataModule):
+    def __init__(self, args, conf):
+        super().__init__()
+        self.prepare_data_per_node = True
+        self.args = args
+        self.conf = conf
+
+    def setup(self, stage: str):
+        if stage == "fit":
+            self.train_set = SpeechTextDataset(self.args.train_id_file, self.args.data_dir, self.args.textgrid_dir, vocab_file=self.conf.data.vocab_file, default_sr=self.conf.data.sr)  
+            self.val_set = SpeechTextDataset(self.args.valid_id_file, self.args.data_dir, self.args.textgrid_dir, vocab_file=self.conf.data.vocab_file, default_sr=self.conf.data.sr)
+        return
+
+    def train_dataloader(self):
+        #sampler = DistributedSampler(self.train_set, shuffle=True, num_replicas=self.args.n_devices)
+        #train_loader = get_dataloader(self.train_set, batch_size=self.conf.training.batch_size // self.args.n_devices, sampler=sampler)
+        train_loader = get_dataloader(self.train_set, batch_size=self.conf.training.batch_size // self.args.n_devices, shuffle=True, use_wav=self.conf.data.use_wav, mel_collator=self.conf.data.mel_collator)
+        return train_loader
+
+    def val_dataloader(self):
+        val_loader = get_dataloader(self.val_set, batch_size=self.conf.training.batch_size, shuffle=False, use_wav=self.conf.data.use_wav, mel_collator=self.conf.data.mel_collator)
+        return val_loader
 
 class SpeechTextDataset(Dataset):
     def __init__(self, id_file, data_dir, textgrid_dir, vocab_file, default_sr=16000):
@@ -64,10 +125,13 @@ class SpeechTextDataset(Dataset):
         return id, wav, dup_phn_strings, phns, durations
 
 class Collator:
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, mel_collator="sb"):
         self.tokenizer = tokenizer
+        self.mel_collator = mel_collator
+        if self.mel_collator == "bigvgan":
+            self.bigvgan_mel = BigVGANMel()
 
-    def collate_fn(self, batch):
+    def wav_collate_fn(self, batch):
         ids = [entry[0] for entry in batch]
         wavs = [entry[1] for entry in batch]
         phn_strings = [entry[2] for entry in batch]
@@ -75,13 +139,28 @@ class Collator:
         ret = self.tokenizer(phn_strings, return_tensors="pt", padding=True, add_special_tokens=False)
         return ids, wavs, wav_len, ret #ret["input_ids"], ret["attention_mask"]
 
+    def mel_collate_fn(self, batch):
+        ids = [entry[0] for entry in batch]
+        wavs = [entry[1] for entry in batch]
+        phn_strings = [entry[2] for entry in batch]
+        if self.mel_collator == "sb":
+            mels = [wav2mel_sb(wav) for wav in wavs]
+        elif self.mel_collator == "bigvgan":
+            print(wavs[0].shape)
+            mels = [self.bigvgan_mel.wav2mel(wav) for wav in wavs]
 
-def get_dataloader(dataset, batch_size, shuffle=True, sampler=None, drop_last=True):
-    collator = Collator(dataset.tokenizer)
+        mels, mel_len = sb.utils.data_utils.batch_pad_right(mels)
+        ret = self.tokenizer(phn_strings, return_tensors="pt", padding=True, add_special_tokens=False)
+        return ids, mels, mel_len, ret #ret["input_ids"], ret["attention_mask"]
+
+
+def get_dataloader(dataset, batch_size, mel_collator="sb", shuffle=True, sampler=None, drop_last=True, use_wav=True):
+    collator = Collator(dataset.tokenizer, mel_collator=mel_collator)
+    collate_fn = collator.wav_collate_fn if use_wav else collator.mel_collate_fn
     if sampler is None:
         data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, 
-                num_workers=0, collate_fn=collator.collate_fn, drop_last=drop_last)
+                num_workers=0, collate_fn=collate_fn, drop_last=drop_last)
     else:
         data_loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, 
-                num_workers=0, collate_fn=collator.collate_fn, drop_last=drop_last)
+                num_workers=0, collate_fn=collate_fn, drop_last=drop_last)
     return data_loader

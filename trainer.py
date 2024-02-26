@@ -2,7 +2,7 @@ import sys
 import os
 import lightning.pytorch as pl
 from model import FairseqWrapper, DiscreteEncoder
-from dataset import SpeechTextDataset, get_dataloader
+from dataset import SpeechTextDataset, get_dataloader, SpeechTextDataModule
 import torch
 from torch.utils.data.distributed import DistributedSampler
 from lightning.pytorch.accelerators import find_usable_cuda_devices
@@ -20,29 +20,6 @@ from lightning.pytorch.callbacks import LearningRateMonitor
 import glob
 from utils import extract_number, replace_values 
 import json
-
-class SpeechTextDataModule(pl.LightningDataModule):
-    def __init__(self, args, conf):
-        super().__init__()
-        self.prepare_data_per_node = True
-        self.args = args
-        self.conf = conf
-
-    def setup(self, stage: str):
-        if stage == "fit":
-            self.train_set = SpeechTextDataset(self.args.train_id_file, self.args.data_dir, self.args.textgrid_dir, vocab_file=self.conf.data.vocab_file)  
-            self.val_set = SpeechTextDataset(self.args.valid_id_file, self.args.data_dir, self.args.textgrid_dir, vocab_file=self.conf.data.vocab_file)
-        return
-
-    def train_dataloader(self):
-        #sampler = DistributedSampler(self.train_set, shuffle=True, num_replicas=self.args.n_devices)
-        #train_loader = get_dataloader(self.train_set, batch_size=self.conf.training.batch_size // self.args.n_devices, sampler=sampler)
-        train_loader = get_dataloader(self.train_set, batch_size=self.conf.training.batch_size // self.args.n_devices, shuffle=True)
-        return train_loader
-
-    def val_dataloader(self):
-        val_loader = get_dataloader(self.val_set, batch_size=self.conf.training.batch_size, shuffle=False)
-        return val_loader
 
 class Distillation(pl.LightningModule): 
     def __init__(self, args, conf): 
@@ -63,7 +40,7 @@ class Distillation(pl.LightningModule):
         elif self.conf.optimizer.loss_function == "L1":
             self.loss_fn = torch.nn.L1Loss(reduction="none") 
         elif self.conf.optimizer.loss_function == "SmoothL1":
-            self.loss_fn = torch.nn.SmoothL1Loss(reduction="none", beta=self.conf.optimizer.beta) 
+            self.loss_fn = torch.nn.SmoothL1Loss(reduction="none", beta=self.conf.optimizer.smooth_beta) 
         else:
             raise NotImplementedError(f"{self.conf.optimizer.loss_function} not implemented.")
         if conf.model.const_layer_weights:
@@ -71,7 +48,11 @@ class Distillation(pl.LightningModule):
 
     def configure_optimizers(self): 
         optimizer_class = getattr(torch.optim, self.conf.optimizer.name)
-        opt = optimizer_class(self.parameters(), lr=self.conf.optimizer.lr)
+        if self.conf.optimizer.name == "AdamW":
+            opt = optimizer_class(self.parameters(), lr=self.conf.optimizer.lr, weight_decay=self.conf.optimizer.weight_decay)
+        else:
+            opt = optimizer_class(self.parameters(), lr=self.conf.optimizer.lr)
+
         scheduler = get_cosine_schedule_with_warmup(opt, num_warmup_steps=self.conf.training.num_warmup_steps, num_training_steps=self.conf.training.max_steps)
         lr_scheduler_config = {
             "optimizer": opt,
@@ -89,7 +70,6 @@ class Distillation(pl.LightningModule):
         ids, wavs, wav_len, text_inputs = batch
         ssl_feats = self.ssl_model(wavs, wav_len)
         feat_dim = ssl_feats.shape[-1]
-        #reversed_feats = ssl_feats[:, ::-1, :, :]
         distilled_feats = self.reverse_model(text_inputs)
 
         length = min(ssl_feats.shape[2], distilled_feats.shape[2])
@@ -181,12 +161,13 @@ def main():
         mode="max",
         every_n_train_steps=args.every_n_steps, 
         dirpath=ckpt_dir,
+        save_last=True,
         filename="model-{step:07d}",
     )
 
     #tb_logger = pl_loggers.TensorBoardLogger(save_dir=f"{ckpt_dir}/logs/")
     wandb.login()
-    wandb_logger = WandbLogger(project="distillation", name=ckpt_dir)
+    wandb_logger = WandbLogger(project="distillation", name=ckpt_dir, resume="allow")
     wandb_logger.watch(distillation, log_freq=args.every_n_steps, log_graph=False)
 
     lr_monitor = LearningRateMonitor(logging_interval='step')
@@ -201,6 +182,8 @@ def main():
 
 
 if __name__ == "__main__":
+    print(torch.cuda.is_available())
+    print(torch.cuda.device_count())
     main()
     #args = placeholder()
     #args.save_path = "/share/data/speech/jjery2243542/checkpoints/hubert/hubert_base_ls960.pt"

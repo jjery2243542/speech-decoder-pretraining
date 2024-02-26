@@ -27,6 +27,22 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+class UpsampleModule(nn.Module):
+    def __init__(self, channel, factor):
+        super().__init__()
+        self.factor = factor
+        self.linear = nn.Linear(channel, channel)
+        self.ln = nn.LayerNorm(normalized_shape=channel, elementwise_affine=False) 
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        x_T = x.transpose(1, 2)
+        x_T_upsample = nn.functional.interpolate(x_T, scale_factor=self.factor, mode='linear', align_corners=False)
+        x = x_T_upsample.transpose(1, 2)
+        x = self.linear(x)
+        x = self.ln(x)
+        x = self.act(x)
+        return x
 
 class FairseqWrapper(nn.Module):
     """This lobe enables the integration of fairseq pretrained wav2vec2.0 models.
